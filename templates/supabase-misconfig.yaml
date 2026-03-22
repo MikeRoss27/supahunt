@@ -1,0 +1,175 @@
+# SupaHunt — Nuclei Templates for Supabase Misconfiguration Detection
+# Usage: nuclei -t supabase-misconfig.yaml -u https://target.com
+
+id: supabase-auth-settings-leak
+info:
+  name: Supabase Auth Settings Disclosure
+  author: supahunt
+  severity: medium
+  description: GoTrue auth settings endpoint exposes signup status, providers, autoconfirm.
+  tags: supabase,auth,misconfiguration
+
+requests:
+  - method: GET
+    path:
+      - "{{BaseURL}}/auth/v1/settings"
+    headers:
+      apikey: "{{anon_key}}"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: word
+        words:
+          - "mailer_autoconfirm"
+          - "disable_signup"
+        condition: or
+
+---
+
+id: supabase-graphql-introspection
+info:
+  name: Supabase GraphQL Introspection Enabled
+  author: supahunt
+  severity: high
+  description: GraphQL introspection reveals full database schema.
+  tags: supabase,graphql,introspection
+
+requests:
+  - method: POST
+    path:
+      - "{{BaseURL}}/graphql/v1"
+    headers:
+      apikey: "{{anon_key}}"
+      Content-Type: application/json
+    body: '{"query":"{__schema{queryType{fields{name}}}}"}'
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: word
+        words:
+          - "queryType"
+          - "fields"
+        condition: and
+
+---
+
+id: supabase-autoconfirm-enabled
+info:
+  name: Supabase Auto-Confirm Signup
+  author: supahunt
+  severity: high
+  description: mailer_autoconfirm is true — accounts are created without email verification.
+  tags: supabase,auth,signup
+
+requests:
+  - method: GET
+    path:
+      - "{{BaseURL}}/auth/v1/settings"
+    headers:
+      apikey: "{{anon_key}}"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: word
+        words:
+          - '"mailer_autoconfirm":true'
+
+---
+
+id: supabase-jwt-claim-injection
+info:
+  name: Supabase JWT Claim Injection via user_metadata
+  author: supahunt
+  severity: critical
+  description: PUT /auth/v1/user allows injecting arbitrary claims into user_metadata.
+  tags: supabase,auth,jwt,privilege-escalation
+  reference:
+    - https://supabase.com/docs/guides/auth
+
+requests:
+  - method: PUT
+    path:
+      - "{{BaseURL}}/auth/v1/user"
+    headers:
+      apikey: "{{anon_key}}"
+      Authorization: "Bearer {{auth_token}}"
+      Content-Type: application/json
+    body: '{"data":{"_supahunt_test":"true"}}'
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: word
+        words:
+          - "_supahunt_test"
+          - "user_metadata"
+        condition: and
+
+---
+
+id: supabase-storage-buckets-list
+info:
+  name: Supabase Storage Buckets Enumerable
+  author: supahunt
+  severity: medium
+  description: Storage bucket list is accessible with anon key.
+  tags: supabase,storage
+
+requests:
+  - method: GET
+    path:
+      - "{{BaseURL}}/storage/v1/bucket"
+    headers:
+      apikey: "{{anon_key}}"
+      Authorization: "Bearer {{anon_key}}"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: regex
+        regex:
+          - '"(id|name)":'
+
+---
+
+id: supabase-rpc-dangerous-functions
+info:
+  name: Supabase Dangerous RPC Functions Callable
+  author: supahunt
+  severity: critical
+  description: Admin/destructive RPC functions callable without proper authorization.
+  tags: supabase,rpc,privilege-escalation
+
+requests:
+  - method: POST
+    path:
+      - "{{BaseURL}}/rest/v1/rpc/expire_premium_subscriptions"
+      - "{{BaseURL}}/rest/v1/rpc/cleanup_old_auth_logs"
+      - "{{BaseURL}}/rest/v1/rpc/cleanup_old_webhook_events"
+      - "{{BaseURL}}/rest/v1/rpc/delete_user"
+      - "{{BaseURL}}/rest/v1/rpc/ban_user"
+      - "{{BaseURL}}/rest/v1/rpc/promote_user"
+    headers:
+      apikey: "{{anon_key}}"
+      Authorization: "Bearer {{anon_key}}"
+      Content-Type: application/json
+    body: '{}'
+    stop-at-first-match: false
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+          - 204
+      - type: word
+        words:
+          - "permission denied"
+        negative: true
