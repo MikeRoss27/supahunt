@@ -412,7 +412,23 @@ class Enumerator:
             except Exception:
                 pass
 
-        return rpcs
+        # Convert RPCFunction objects to dicts for consistent API
+        return [self._rpc_to_dict(r) for r in rpcs]
+
+    @staticmethod
+    def _rpc_to_dict(rpc) -> dict:
+        """Convert RPCFunction to dict with all expected keys."""
+        if isinstance(rpc, dict):
+            return rpc
+        return {
+            "name": rpc.name,
+            "callable": rpc.callable,
+            "requires_params": rpc.requires_params,
+            "error": rpc.error,
+            "result": getattr(rpc, "result", None),
+            "impact": "",
+            "response": getattr(rpc, "result", "") or rpc.error or "",
+        }
 
     # ──────────────────────────────────────────────
     # GRAPHQL INTROSPECTION

