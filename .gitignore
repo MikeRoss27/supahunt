@@ -4,7 +4,24 @@ __pycache__/
 output/
 exfil/
 *.egg-info/
+*.eggs/
 dist/
 build/
+*.whl
+*.tar.gz
+src/*.egg-info/
 .env
+.env.*
 *.log
+
+# Target data / scan artifacts
+*.json.bak
+injected_*.json
+/reports/
+/tmp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

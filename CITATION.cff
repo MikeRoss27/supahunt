@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use SupaHunt in your research or security assessments, please cite it as below."
+type: software
+title: "SupaHunt"
+abstract: "Supabase Security Auditing & Penetration Testing Framework"
+authors:
+  - alias: "MikeRoss27"
+version: 3.0.0
+date-released: 2026-03-23
+license: MIT
+url: "https://github.com/MikeRoss27/supahunt"
+repository-code: "https://github.com/MikeRoss27/supahunt"
+keywords:
+  - supabase
+  - security
+  - penetration-testing
+  - bug-bounty
+  - rls-bypass
+  - graphql
+  - postgrest
