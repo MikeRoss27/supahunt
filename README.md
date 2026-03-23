@@ -1,4 +1,8 @@
 <p align="center">
+  <img src="assets/banner.png" alt="SupaHunt Banner" width="800">
+</p>
+
+<p align="center">
   <h1 align="center">SupaHunt</h1>
   <p align="center">
     <b>Supabase Security Auditing & Penetration Testing Framework</b>
